@@ -83,6 +83,7 @@ void emu_trace_callback_exit(void)
 
 unsigned int emu_do_callback(void* fn, void* reserved, ...);
 void emu_callback_ret(void);
+unsigned int emu_call_native(void* param, unsigned int param_len, void* fn);
 
 void* emu_malloc(unsigned int sz)
 {

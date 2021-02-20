@@ -81,6 +81,12 @@ emu_do_callback:
 push {r2, r3}
 ldr r2, =0x179
 push {r2}
+mov r2, r4
+mov r3, lr
+ldr r4, =16383
+bl __chkstk
+mov lr, r3
+mov r4, r2
 mov r2, sp
 ldr r3, =65532
 sub r3, r2, r3
@@ -100,8 +106,35 @@ add r2, r3
 mov sp, r2
 bx lr
 
+emu_call_native:
+push {fp, lr}
+mov fp, sp
+sub sp, r1
+sub sp, #16
+mov r3, sp
+tst r3, #7
+beq 1f
+sub sp, #4
+1:
+cbz r1, 3f
+mov r3, sp
+add r1, r3
+2:
+ldr ip, [r0], #4
+str ip, [r3], #4
+cmp r1, r3
+bne 2b
+3:
+mov ip, r2
+pop {r0, r1, r2, r3}
+blx ip
+mov sp, fp
+pop {fp, pc}
+
 emu_entry:
 //bl iat_fixup //XXX
+ldr r4, =16384
+bl __chkstk
 mov r0, sp
 mov r8, r0
 sub r0, r0, #65536
@@ -139,6 +172,26 @@ bl emu_trace_c
 pop {r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, lr}
 msr cpsr_f, r1
 bx lr
+
+__chkstk:
+cbz r4, 3f
+lsl r4, r4, #2
+sub r12, sp, r4
+sub r4, sp, #2048
+sub r4, #2048
+cmp r4, r12
+bcc 2f
+1:
+str r4, [r4]
+sub r4, #2048
+sub r4, #2048
+cmp r4, r12
+bcs 1b
+2:
+str r12, [r12]
+sub r4, sp, r12
+3:
+bx lr
 '''
 
 if not TRACE:
@@ -170,6 +223,7 @@ def guess_bitness(instr):
     else: return 32
 
 def read_mem(f, addr, reg, ldrop='ldr'):
+    log2 = {1: 0, 2: 1, 4: 2, 8: 3}
     try: addr = int(addr, 16)
     except ValueError: pass
     else:
@@ -180,8 +234,24 @@ def read_mem(f, addr, reg, ldrop='ldr'):
         print(ldrop, '%s, [%s]'%(reg, reg_mapping[addr]), file=f)
         return
     addr = addr.replace(' - ', ' + -')
+    if addr.count(' + ') == 2:
+        left, middle, right = addr.split(' + ')
+        right = int(right, 0)
+        if '*' in middle:
+            middle, scale = middle.split('*')
+            scale = log2[int(scale)]
+            print('add r2, %s, %s, lsl %d'%(reg_mapping[left], reg_mapping[middle], scale), file=f)
+        else:
+            print('add r2, %s, %s'%(reg_mapping[left], reg_mapping[middle]), file=f)
+        if right in range(-255, 4096):
+            print('%s %s, [r2, #%s]'%(ldrop, reg, hex(right)), file=f)
+        else:
+            print('ldr r3, ='+hex(right), file=f)
+            print('add r2, r3', file=f)
+            print('%s %s, [r2]'%(ldrop, reg), file=f)
+        return
     if ' + ' in addr:
-        left, right = addr.split(' + ')
+        left, right = addr.split(' + ', 1)
         if left in reg_mapping: 
             try: right = int(right, 0)
             except ValueError: pass
@@ -247,7 +317,7 @@ def write_mem(f, addr, reg):
             print('str %s, [r2]'%reg, file=f)
         return
     if ' + ' in addr:
-        left, right = addr.split(' + ')
+        left, right = addr.split(' + ', 1)
         if left in reg_mapping: 
             try: right = int(right, 0)
             except ValueError: pass
@@ -375,6 +445,11 @@ def lea(f, addr, reg):
                 assert right in reg_mapping, "lea failed"
                 print('add %s, %s, %s, lsl #%d'%(reg, reg_mapping[left], reg_mapping[right], log2[scale]), file=f)
                 return
+    if '*' in addr:
+        left, right = addr.split('*', 1)
+        assert left in reg_mapping, "lea wtf"
+        print('lsl %s, %s, #%d'%(reg, reg_mapping[left], log2[int(right)]), file=f)
+        return
     if addr in reg_mapping:
         print('mov %s, %s'%(reg, reg_mapping[addr]), file=f)
         return

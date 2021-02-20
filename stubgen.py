@@ -54,7 +54,86 @@ void _initterm(void(** start)(void), void(** end)(void))
             (**start)();
         start++;
     }
-}''', '')
+}
+''', ''),
+    'printf': ('''\
+asm(".global _printf\\n_printf:\\npush %eax\\nmov %esp, %eax\\nsyscall\\npop %eax\\nret");
+''', '''\
+#define DO_PRINTF(SINGLE, DOUBLE, LF) do {\\
+    int nll = -1;\\
+    for(unsigned int i = 0; fmts[i]; i++)\\
+    {\\
+        if(nll < 0)\\
+        {\\
+            if(fmts[i] == '%')\\
+                nll = 0;\\
+            continue;\\
+        }\\
+        switch(fmts[i])\\
+        {\\
+        case 'l':\\
+            nll++;\\
+            break;\\
+        case 'j':\\
+        case 'L':\\
+            nll = 2;\\
+            break;\\
+        case 'd':\\
+        case 'i':\\
+        case 'u':\\
+        case 'o':\\
+        case 'x':\\
+        case 'X':\\
+        case 'c':\\
+            {\\
+                if(nll == 2)\\
+                    DOUBLE;\\
+                else\\
+                    SINGLE;\\
+                nll = -1;\\
+                break;\\
+            }\\
+        case 's':\\
+        case 'S':\\
+        case 'p':\\
+        case 'n':\\
+            nll = -1;\\
+        case '*':\\
+            SINGLE;\\
+            break;\\
+        case 'f':\\
+        case 'F':\\
+        case 'e':\\
+        case 'E':\\
+        case 'g':\\
+        case 'G':\\
+        case 'a':\\
+        case 'A':\\
+            DOUBLE;\\
+            nll = -1;\\
+            break;\\
+        case '%':\\
+            nll = -1;\\
+            break;\\
+        }\\
+    }\\
+} while(0)
+
+void wrapper_printf(unsigned int* stack)
+{
+    char* fmts = (void*)stack[2];
+    unsigned int nwords = 1;
+    DO_PRINTF(nwords++, nwords += nwords % 2 + 2, );
+    unsigned int* src = stack + 2;
+    unsigned int tgt[nwords];
+    tgt[0] = (unsigned int)fmts;
+    unsigned int src_idx = 1, tgt_idx = 1;
+    DO_PRINTF(tgt[tgt_idx++] = src[src_idx++], (tgt_idx += tgt_idx % 2, tgt[tgt_idx++] = src[src_idx++], tgt[tgt_idx++] = src[src_idx++]), src_idx++);
+    stack[0] = (unsigned int)emu_call_native(tgt, nwords*4, WINAPI::[printf]);
+}
+
+#undef DO_PRINTF
+''')
 }
 
 def get_headers(arch):
