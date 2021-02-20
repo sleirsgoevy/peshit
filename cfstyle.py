@@ -14,6 +14,7 @@ def propagate_cf_uses(cfg, cf_uses):
     assert cf_uses_0.issubset(cf_uses)
     return cf_uses
 
-def calculate_cf_style(cfg, cf_uses, cf_styles):
+def calculate_cf_style(cfg, cf_uses, ef_uses, cf_styles):
     cf_uses = propagate_cf_uses(cfg, cf_uses)
-    return {i: j if i in cf_uses else 'none' for i, j in cf_styles.items()}
+    ef_uses = propagate_cf_uses(cfg, ef_uses)
+    return {i: j if i in cf_uses else ('none' if i in ef_uses else 'noone') for i, j in cf_styles.items()}

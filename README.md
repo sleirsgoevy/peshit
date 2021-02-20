@@ -17,6 +17,7 @@ Output compatibility:
 
 - [x] Recompiled executables run in Wine on ARM
 - [ ] Recompiled executables run in Windows on ARM
+- [ ] Recompiled executables can be inspected using binutils
 
 ## Non-goals
 
