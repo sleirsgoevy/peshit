@@ -133,8 +133,44 @@ void wrapper_printf(unsigned int* stack)
 }
 
 #undef DO_PRINTF
-''')
+'''),
+'CreateThread': '''\
+DWORD thread_callback(void* param)
+{
+    void** x = param;
+    void* x86_function = x[0];
+    void* x86_param = x[1];
+    ((typeof(&SetEvent))WINAPI::[SetEvent])((HANDLE)x[2]);
+    return emu_do_callback(x86_function, 0, x86_param);
 }
+
+void wrapper_CreateThread(struct
+{
+    LPSECURITY_ATTRIBUTES lpThreadAttributes;
+    SIZE_T dwStackSize;
+    LPTHREAD_START_ROUTINE lpStartAddress;
+    LPVOID lpParameter;
+    DWORD dwCreationFlags;
+    LPDWORD lpThreadId;
+    HANDLE ans;
+}* param)
+{
+    HANDLE evt = ((typeof(&CreateEventA))WINAPI::[CreateEventA])(NULL, FALSE, FALSE, "thread creation");
+    if(!evt)
+    {
+        param->ans = evt;
+        return;
+    }
+    void* x[3] = {param->lpStartAddress, param->lpParameter, (void*)evt};
+    HANDLE thr = ((typeof(&CreateThread))WINAPI::[CreateThread])(param->lpThreadAttributes, param->dwStackSize, thread_callback, x, param->dwCreationFlags, param->lpThreadId);
+    ((typeof(&WaitForSingleObject))WINAPI::[WaitForSingleObject])(evt, INFINITE);
+    ((typeof(&CloseHandle))WINAPI::[CloseHandle])(evt);
+    param->ans = thr;
+}
+'''
+}
+
+wrapper_deps = {'CreateThread': [('kernel32.dll', 'CreateEventA'), ('kernel32.dll', 'SetEvent'), ('kernel32.dll', 'WaitForSingleObject'), ('kernel32.dll', 'CloseHandle')]}
 
 def get_headers(arch):
     p = subprocess.Popen((arch+'-w64-mingw32-gcc', '-E', '-P', '-'), stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding='utf-8')

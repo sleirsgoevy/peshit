@@ -55,7 +55,7 @@ def compile_arm(c_code, asm_code, link_addr):
         p = subprocess.Popen((CC_ARM+'gcc', '-fno-addrsig', '-fno-asynchronous-unwind-tables', '-x', 'c', '-', '-S', '-o', '-'), stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding='utf-8')
         asm_code = clang_sucks(p.communicate(c_code)[0] + asm_code + '\n.global _start\n_start:\n')
         assert not p.wait()
-        p = subprocess.Popen((CC_ARM_HOST+'gcc', '-march=armv8-a', '-x', 'assembler', '-', '-nostdlib', '-static', '-Ttext='+hex(link_addr), '-o', file+'/out.elf'), stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding='utf-8')
+        p = subprocess.Popen((CC_ARM_HOST+'gcc', '-march=armv8-a', '-mfpu=neon', '-x', 'assembler', '-', '-nostdlib', '-static', '-Ttext='+hex(link_addr), '-o', file+'/out.elf'), stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding='utf-8')
         p.communicate(asm_code)
         assert not p.wait()
         with open(file+'/out.elf', 'rb') as f:

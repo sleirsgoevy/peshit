@@ -74,12 +74,23 @@ def build_iat(x, v, iat):
     x.offset_table[1] = (addr + x.base_addr, len(strings) + strings_offset)
     return symbols
 
-def iatindir(x, v, add_symbols=[]):
+def iatindir(x, v, add_symbols=[], deps={}):
     iat = parse_iat(x, v)
     for dllname, name in add_symbols:
         dllname = CaseInsensitive(dllname)
         if dllname not in iat: iat[dllname] = collections.OrderedDict()
         if name not in iat[dllname]: iat[dllname][name] = (0, None)
+    syms = [j for i in iat.values() for j in i]
+    syms_s = set(syms)
+    for i in syms:
+        if i not in deps: continue
+        for dllname, name in deps[i]:
+            dllname = CaseInsensitive(dllname)
+            if dllname not in iat: iat[dllname] = collections.OrderedDict()
+            if name not in iat[dllname]: iat[dllname][name] = (0, None)
+            if name not in syms_s:
+                syms_s.add(name)
+                syms.append(name)
     return build_iat(x, v, iat)
 
 def main():

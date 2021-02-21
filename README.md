@@ -9,7 +9,7 @@ Exceptions in recompiler code are postponed until runtime, so that e.g.bogus "in
 X86 implementation status:
 
 - [x] "Hello, world!" compiles and runs
-- [ ] (2/14) [box86](https://github.com/ptitSeb/box86) test suite compiles and runs
+- [ ] (6/14) [box86](https://github.com/ptitSeb/box86) test suite compiles and runs
 - [ ] [box86](https://github.com/ptitSeb/box86) test suite compiles and runs with MSVC
 - [ ] At least one real application compiles and runs
 
