@@ -1,6 +1,6 @@
 import capstone, pefile, vmem, io, json, collections, cfstyle, traceback, x87
 
-TRACE = True
+TRACE = False
 TRACEBACKS = True
 
 def read_instr_at(cs, v, addr):
@@ -14,13 +14,14 @@ def read_instr_at(cs, v, addr):
         addr += 1
     return None
 
-cf_add_style_instrs = ('add', 'lock add', 'lock xadd')
+cf_add_style_instrs = ('add', 'lock add', 'lock xadd', 'adc')
 cf_sub_style_instrs = ('sub', 'cmp', 'lock cmpxchg', 'neg')
 cf_xor_style_instrs = ('xor', 'and', 'test', 'or')
 cf_shift_style_instrs = ('shl', 'sal', 'shr', 'sar')
 cf_fuckup_style_instrs = ('idiv',)
 cf_bt_style_instrs = ('bt',)
-CF_FUCKUP = {'bt', 'fstsw'}
+CF_FUCKUP = {'bt', 'fstsw', 'fpu_emu'}
+cf_ccodes = {'a', 'b', 'ae', 'be', 'g', 'l', 'ge', 'le'}
 
 def get_labels(cs, x, v, preseed0):
     preseed = []
@@ -29,18 +30,19 @@ def get_labels(cs, x, v, preseed0):
             preseed.append(i[1]) # vma
     preseed.extend(preseed0)
     preseed.sort()
+    preseed1 = list(preseed)
     preseed_set = set(preseed)
     labels = set()
     label_list = []
     cf_uses = set()
     ef_uses = set()
     cfg = collections.defaultdict(list)
+    d_cfg = collections.defaultdict(list)
+    b_cfg = collections.defaultdict(list)
     instrs = {}
     cf_styles = {}
-    fpu_states = {}
     for i in preseed:
         cur_cf_style = 'none'
-        cur_fpu_state = x87.DEFAULT_STATE
         while i not in labels:
             iii = i
             labels.add(i)
@@ -48,18 +50,18 @@ def get_labels(cs, x, v, preseed0):
             ii = read_instr_at(cs, v, i)
             if ii == None: break
             cf_styles[i] = cur_cf_style
-            fpu_states[i] = cur_fpu_state
-            cur_fpu_state = x87.translate_state(cur_fpu_state, ii.mnemonic)
             instrs[i] = ii.mnemonic
             i += len(ii.bytes)
             if (ii.mnemonic[0] == 'j' and ii.mnemonic != 'jmp') or ii.mnemonic.startswith('set') or ii.mnemonic.startswith('cmov'):
                 ef_uses.add(iii)
+            if ii.mnemonic in ('adc', 'sbb'): cf_uses.add(iii)
             if (ii.mnemonic[0] == 'j' or ii.mnemonic == 'call') and ii.op_str.startswith('0x'):
-                if ii.mnemonic in ('ja', 'jb', 'jae', 'jbe', 'jg', 'jl', 'jge', 'jle'): cf_uses.add(iii)
+                if ii.mnemonic[0] == 'j' and ii.mnemonic[1:] in cf_ccodes: cf_uses.add(iii)
                 dst = int(ii.op_str, 16)
                 if dst not in preseed_set:
                     preseed.append(dst)
                     preseed_set.add(dst)
+            if ii.mnemonic.startswith('cmov') and ii.mnemonic[4:] in cf_ccodes: cf_uses.add(iii)
             if ii.mnemonic in cf_add_style_instrs:
                 cur_cf_style = 'add'
             elif ii.mnemonic in cf_sub_style_instrs:
@@ -74,24 +76,38 @@ def get_labels(cs, x, v, preseed0):
                 cur_cf_style = 'noone'
             elif ii.mnemonic in cf_bt_style_instrs:
                 cur_cf_style = 'bt'
+            elif ii.mnemonic in ('fist', 'fistp') and ii.op_str.startswith('word ptr ['):
+                cur_cf_style = 'fpu_emu'
             # cutting the CFG on CF-style changes is intentional
             elif ii.mnemonic in ('jmp', 'call'):
                 try: dst = int(ii.op_str, 16)
                 except ValueError: pass
                 else: cfg[dst].append(iii)
                 cur_cf_style = 'noone'
-                cur_fpu_state = x87.DEFAULT_STATE
             elif ii.mnemonic.startswith('j'):
                 dst = int(ii.op_str, 16)
                 cfg[dst].append(iii)
                 cfg[i].append(iii)
-                cur_fpu_state = x87.DEFAULT_STATE
             elif ii.mnemonic == 'ret':
                 cur_cf_style = 'noone'
-                cur_fpu_state = x87.DEFAULT_STATE
             else:
                 cfg[i].append(iii)
-    return label_list, cfstyle.calculate_cf_style(cfg, cf_uses, ef_uses, cf_styles), fpu_states
+            if ii.mnemonic in ('jmp', 'call'):
+                try: dst = int(ii.op_str, 16)
+                except ValueError: pass
+                else:
+                    d_cfg[iii].append(dst)
+                b_cfg[iii].append(i)
+            elif ii.mnemonic.startswith('j'):
+                dst = int(ii.op_str, 16)
+                d_cfg[iii].append(dst)
+                d_cfg[iii].append(i)
+            elif ii.mnemonic == 'ret':
+                cur_cf_style = 'noone'
+                b_cfg[iii].append(i)
+            else:
+                d_cfg[iii].append(i)
+    return label_list, cfstyle.calculate_cf_style(cfg, cf_uses, ef_uses, cf_styles), x87.calculate_fpu_states(d_cfg, b_cfg, instrs, preseed1)
 
 arm_crt = '''\
 .p2align 2
@@ -254,6 +270,10 @@ vstr d8, [r0, #64]
 vstr d9, [r0, #72]
 bx lr
 
+emu_trace_get_fpu_fpscr:
+vmrs r0, fpscr
+bx lr
+
 //fpu sw layout: busy C3 t_o_p C2 C1 C0 sum stack inexact undf ovf /0 denormal_operand invalid
 
 emu_fxam:
@@ -294,6 +314,139 @@ bx lr
 emu_fxam_denorm:
 orr r0, #0x44000000
 bx lr
+
+emu_fsin:
+//d9 = arg
+//d9 = ans
+push {fp, lr}
+mrs fp, cpsr
+vmov r0, r1, d0
+push {r0, r1}
+vmov r0, r1, d1
+push {r0, r1}
+vmov r0, r1, d2
+push {r0, r1}
+vmov r0, r1, d3
+push {r0, r1}
+vmov r0, r1, d4
+push {r0, r1}
+vmov r0, r1, d5
+push {r0, r1}
+vmov r0, r1, d6
+push {r0, r1}
+vmov r0, r1, d7
+push {r0, r1}
+vmov r0, r1, d8
+push {r0, r1}
+vmov r0, r1, d10
+push {r0, r1}
+vmov d0, d9
+bl emu_fsin_c
+vmov d9, d0
+pop {r0, r1}
+vmov d10, r0, r1
+pop {r0, r1}
+vmov d8, r0, r1
+pop {r0, r1}
+vmov d7, r0, r1
+pop {r0, r1}
+vmov d6, r0, r1
+pop {r0, r1}
+vmov d5, r0, r1
+pop {r0, r1}
+vmov d4, r0, r1
+pop {r0, r1}
+vmov d3, r0, r1
+pop {r0, r1}
+vmov d2, r0, r1
+pop {r0, r1}
+vmov d1, r0, r1
+pop {r0, r1}
+vmov d0, r0, r1
+msr cpsr_f, fp
+pop {fp, pc}
+
+emu_fstcw:
+//r0 = cw << 16
+vmrs r1, fpscr
+mov r2, #0x003c0000
+and r0, r2, r1, lsl #9
+mov r2, #0x0c000000
+and r2, r2, r1, lsl #2
+orr r0, r2
+orr r0, #0x03000000
+bx lr
+
+emu_fldcw:
+//r0 = cw << 16
+vmrs r1, fpscr
+ldr r2, =0xff3fe1ff
+and r1, r2
+mov r2, #0x00001e00
+and r2, r2, r1, lsr #9
+orr r1, r2
+mov r2, #0x00c00000
+and r2, r2, r1, lsr #2
+orr r1, r2
+vmsr fpscr, r1
+bx lr
+
+emu_fist64:
+push {r4, lr}
+mov r4, r0
+mrs ip, cpsr
+vmov r0, r1, d9
+lsl r1, #1
+lsr r1, #1
+ldr r2, =0x43e00000
+cmp r1, r2
+bcs emu_fist64_overflow
+ldr r2, =0x08000000
+cmp r1, r2
+bcc emu_fist64_zero
+vmov r0, r1, d9
+sub r1, #0x02000000
+vmov d11, r0, r1
+vcvt.s32.f64 s22, d11
+vmov r3, s22
+vcvt.f64.s32 d11, s22
+vmov r0, r1, d11
+add r1, #0x02000000
+vmov d11, r0, r1
+vsub.f64 d9, d11
+vmov r0, r1, d9
+sub r1, #0x01000000
+vmov d11, r0, r1
+vcvt.s32.f64 s22, d11
+vmov r2, s22
+add r3, r3, r2, asr #16
+lsl r2, #16
+vcvt.f64.s32 d11, s22
+vmov r0, r1, d11
+add r1, #0x01000000
+vmov d11, r0, r1
+vsub.f64 d9, d11
+tst r4, r4
+it eq
+vcvteq.s32.f64 s18, d9
+it ne
+vcvtrne.s32.f64 s18, d9
+vmov r0, s18
+asr r1, r0, #31
+adds r0, r2
+adc r1, r3
+msr cpsr_f, ip
+pop {r4, pc}
+emu_fist64_overflow:
+mov r0, #0
+mov r1, #0x80000000
+msr cpsr_f, ip
+pop {r4, pc}
+emu_fist64_zero:
+mov r0, #0
+mov r1, #0
+msr cpsr_f, ip
+pop {r4, pc}
 
 __chkstk:
 cbz r4, 3f
@@ -603,7 +756,7 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                 except KeyError: assert False, "unknown CF style"
                 try: cur_fpu_state = fpu_state[l]
                 except KeyError: assert False, "unknown FPU state"
-                if instr in ('add', 'sub', 'xor', 'and', 'or') or instr == 'lock add' and ('[' not in ii.op_str or ii.op_str.find('[') > ii.op_str.find(',')):
+                if instr in ('add', 'sub', 'xor', 'and', 'or') or instr == 'adc' and cur_cf_style == 'add' or instr == 'lock add' and ('[' not in ii.op_str or ii.op_str.find('[') > ii.op_str.find(',')):
                     if instr == 'xor': instr = 'eor'
                     if instr == 'or': instr = 'orr'
                     arg1, arg2 = map(str.strip, ii.op_str.split(','))
@@ -638,7 +791,7 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                         print('bx r0', file=f)
                     else:
                         assert target in cf_style and cf_style[target] in ('none', 'noone'), "call to CF-aware code"
-                        assert cur_fpu_state == fpu_state[target] == x87.DEFAULT_STATE, "FPU ABI violation"
+                        assert cur_fpu_state == fpu_state[target] == x87.DEFAULT_STATE, "FPU ABI violation: caller %r, callee %r"%(cur_fpu_state, fpu_state[target])
                         print('ldr r1, ='+hex(l+len(ii.bytes)), file=f)
                         print('str r1, [r8, #-4]!', file=f)
                         print('b x86_%x'%target, file=f)
@@ -724,6 +877,8 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                     print('mov r8, r9', file=f)
                     print('ldr r9, [r8], #4', file=f)
                 elif instr == 'ret':
+                    cur_fpu_state = x87.ret_hack(f, cur_fpu_state)
+                    x87.check_jump(cur_fpu_state, x87.DEFAULT_STATE)
                     print('ldr r0, [r8], #4', file=f)
                     try: stdcall = int(ii.op_str, 0)
                     except ValueError: pass
@@ -808,7 +963,7 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                     bitness2 = guess_bitness(arg2)
                     assert bitness2 < bitness1, "invalid movzx"
                     arg2r = read_arg(f, arg2, read_arg(f, arg1, 'r0', fake=True), bitness=bitness2)
-                    print(('a' if instr[4] == 's' else 'l')+'sr %s, #%d'%(arg2r, bitness1 - bitness2), file=f)
+                    print(('a' if instr[3] == 's' else 'l')+'sr %s, #%d'%(arg2r, bitness1 - bitness2), file=f)
                     write_arg(f, arg1, arg2r)
                 elif instr == 'fninit': pass # TODO: stub
                 elif instr in ('cmove', 'cmovs', 'cmovns'):
@@ -816,6 +971,14 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                     arg1, arg2 = map(str.strip, ii.op_str.split(','))
                     assert arg1 in reg_mapping and arg2 in reg_mapping, "weird cmove args"
                     cc = {'e': 'eq', 's': 'mi', 'ns': 'pl'}[instr[4:]]
+                    print('it', cc, file=f)
+                    print('mov%s %s, %s'%(cc, reg_mapping[arg1], reg_mapping[arg2]), file=f)
+                elif instr in ('cmovl', 'cmovle', 'cmovg', 'cmovge'):
+                    assert cur_cf_style in ('add', 'sub'), cur_cf_style
+                    arg1, arg2 = map(str.strip, ii.op_str.split(','))
+                    assert arg1 in reg_mapping and arg2 in reg_mapping, "weird cmove args"
+                    cc = instr[4:]
+                    if len(cc) == 1: cc += 't'
                     print('it', cc, file=f)
                     print('mov%s %s, %s'%(cc, reg_mapping[arg1], reg_mapping[arg2]), file=f)
                 elif instr == 'imul' and ',' not in ii.op_str:
@@ -968,8 +1131,22 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                         print('x86_%x_ok:'%l, file=f)
                         print('mov %s, r1'%reg_mapping[arg2], file=f)
                 elif instr in ('wait', 'fwait'): pass
+                elif instr == 'adc' and cur_cf_style == 'sub':
+                    #invert CF
+                    print('mov r0, #0', file=f)
+                    print('it cc', file=f)
+                    print('movcc r0, #0x80000000', file=f)
+                    print('adds r0, r0', file=f)
+                    arg1, arg2 = map(str.strip, ii.op_str.split(','))
+                    arg1r = read_arg(f, arg1, 'r0', bitness=bitness)
+                    arg2r = read_arg(f, arg2, 'r1', bitness=bitness)
+                    print('adc %s, %s, %s'%(arg1r, arg1r, arg2r), file=f)
+                    write_arg(f, arg1, arg1r)
                 elif instr.startswith('f'):
                     x87.emit(f, cf_style, cur_cf_style, fpu_state[l], l, ii, bitness)
+                elif instr == 'cwde':
+                    print('lsl r4, #16', file=f)
+                    print('asr r4, #16', file=f)
                 else:
                     assert False, "unknown mnemonic %s"%ii.mnemonic
                 tr_success += 1

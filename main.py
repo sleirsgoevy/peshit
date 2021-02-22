@@ -1,4 +1,4 @@
-import pefile, vmem, iatindir, stubgen, recompiler, cc, indir, tlshooks
+import pefile, vmem, iatindir, stubgen, recompiler, cc, indir, tlshooks, x87
 
 arm_crt = r'''
 asm("sys_write:\nmov r7, #4\nsvc #0\nbx lr");
@@ -51,7 +51,10 @@ void emu_indir_invalid(unsigned int addr)
     *(void* volatile*)0;
 }
 
-void emu_trace_c(unsigned int eip, unsigned int regs[12])
+void emu_trace_get_fpu_regs(unsigned int*);
+unsigned int emu_trace_get_fpu_fpscr(void);
+
+void emu_trace_c(unsigned int eip, unsigned int regs[12], int do_dump_fpu)
 {
     dbg_puts("eip=");
     dbg_putn(eip);
@@ -67,6 +70,22 @@ void emu_trace_c(unsigned int eip, unsigned int regs[12])
     D(esi, 9);
     D(edi, 10);
 #undef D
+    if(do_dump_fpu)
+    {
+        unsigned int fpu_regs[20];
+        emu_trace_get_fpu_regs(fpu_regs);
+        for(int i = 0; i < 10; i++)
+        {
+            if(i == do_dump_fpu)
+                dbg_puts(" |");
+            char buf[5] = {' ', 'd', '0'+i, '=', 0};
+            dbg_puts(buf);
+            dbg_putn(fpu_regs[2*i+1]);
+            dbg_putn(fpu_regs[2*i]);
+        }
+        dbg_puts(" fpscr=");
+        dbg_putn(emu_trace_get_fpu_fpscr());
+    }
     dbg_puts("\n");
 }
 
@@ -79,6 +98,11 @@ unsigned int emu_trace_callback_entry(unsigned int param)
 void emu_trace_callback_exit(void)
 {
     dbg_puts(">>> callback\n");
+}
+
+double emu_fsin_c(double d)
+{
+    return ((double(*)(double))WINAPI::[sin])(d);
 }
 
 unsigned int emu_do_callback(void* fn, void* reserved, ...);
@@ -119,7 +143,7 @@ def main(f1, f2):
     with open(f1, 'rb') as file:
         x = pefile.PeFile(file.read())
     v = vmem.VirtualMemory(x.sections, x.mem_align)
-    imports = iatindir.iatindir(x, v, [('kernel32.dll', 'VirtualAlloc'), ('kernel32.dll', 'FlushInstructionCache')])
+    imports = iatindir.iatindir(x, v, [('kernel32.dll', 'VirtualAlloc'), ('kernel32.dll', 'FlushInstructionCache')]+x87.api_deps, deps=stubgen.wrapper_deps)
     import_map = {l: j for i, j, k, l in imports}
     imports = [i for i in imports if i[0] != None]
     x86_stub, arm_stub, wrapper_names = stubgen.gen_decls('i686', {l: '*(void**)'+hex(j) for i, j, k, l in imports})
