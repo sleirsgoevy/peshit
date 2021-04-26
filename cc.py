@@ -57,7 +57,9 @@ def compile_arm(c_code, asm_code, link_addr):
         assert not p.wait()
         p = subprocess.Popen((CC_ARM_HOST+'gcc', '-march=armv8-a', '-mfpu=neon', '-x', 'assembler', '-', '-nostdlib', '-static', '-Ttext='+hex(link_addr), '-o', file+'/out.elf'), stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding='utf-8')
         p.communicate(asm_code)
-        assert not p.wait()
+        if p.wait():
+            __import__('pydoc').pager(asm_code)
+            assert False
         with open(file+'/out.elf', 'rb') as f:
             text_vma, text = elf_extract_text(f.read())
         return (text, nm(CC_ARM_HOST, file+'/out.elf', text_vma))

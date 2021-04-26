@@ -208,5 +208,6 @@ def emit(f, cf_style, cur_cf_style, fpu_state, l, ii, bitness):
         assert not ii.op_str
         print('vldr d9, =0', file=f)
         print('vsub.f64 %s, d9, %s'%(st(0), st(0)), file=f)
+    elif instr in ('fclex', 'fnclex'): pass
     else:
         assert False, "unknown FPU command %s (CW style %s)"%(ii.mnemonic, cw_style)

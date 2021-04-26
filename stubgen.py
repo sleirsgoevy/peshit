@@ -1,4 +1,4 @@
-import subprocess, pycparser.c_generator
+import subprocess, pycparser.c_generator, recompiler, json
 
 headers = '''\
 #include <windows.h>
@@ -167,7 +167,92 @@ void wrapper_CreateThread(struct
     ((typeof(&CloseHandle))WINAPI::[CloseHandle])(evt);
     param->ans = thr;
 }
-'''
+''',
+'GetProcAddress': ('''\
+struct emu_dlsymtab_entry
+{
+    char* name;
+    void* func;
+};
+
+extern struct emu_dlsymtab_entry emu_dlsymtab_start[], emu_dlsymtab_end[];
+
+struct opaque
+{
+    struct emu_dlsymtab_entry* begin;
+    struct emu_dlsymtab_entry* end;
+    HMODULE hModule;
+    LPCSTR lpProcName;
+    FARPROC ans;
+};
+
+__attribute__((stdcall)) FARPROC GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
+{
+    struct opaque opaq;
+    opaq.begin = emu_dlsymtab_start;
+    opaq.end = emu_dlsymtab_end;
+    opaq.hModule = hModule;
+    opaq.lpProcName = lpProcName;
+    asm volatile("syscall"::"a"(&opaq));
+    return opaq.ans;
+}''', '''\
+struct emu_dlsymtab_entry
+{
+    char* name;
+    void* func;
+};
+
+struct opaque
+{
+    struct emu_dlsymtab_entry* begin;
+    struct emu_dlsymtab_entry* end;
+    HMODULE hModule;
+    LPCSTR lpProcName;
+    FARPROC ans;
+};
+
+void wrapper_GetProcAddress(struct opaque* opaq)
+{
+    HANDLE hModule = opaq->hModule;
+    LPCSTR lpProcName = opaq->lpProcName;
+    struct emu_dlsymtab_entry* left = opaq->begin;
+    struct emu_dlsymtab_entry* right = opaq->end;
+    int idx = 0;
+    do
+    {
+        struct emu_dlsymtab_entry* sep = right;
+        while(sep - left > 1)
+        {
+            struct emu_dlsymtab_entry* mid = left + (sep - left) / 2;
+            if(mid->name[idx] >= lpProcName[idx])
+                sep = mid;
+            else
+                left = mid;
+        }
+        if(sep == right || sep->name[idx] != lpProcName[idx])
+            goto return0;
+        if(left->name[idx] < lpProcName[idx])
+            left = sep;
+        sep = left;
+        while(right - sep > 1)
+        {
+            struct emu_dlsymtab_entry* mid = sep + (right - sep) / 2;
+            if(mid->name[idx] > lpProcName[idx])
+                right = mid;
+            else
+                sep = mid;
+        }
+        if(left == right || left->name[idx] != lpProcName[idx])
+            goto return0;
+    }
+    while(lpProcName[idx++]);
+    opaq->ans = left->func;
+    return;
+return0:
+    opaq->ans = 0;
+    return;
+}
+''')
 }
 
 wrapper_deps = {'CreateThread': [('kernel32.dll', 'CreateEventA'), ('kernel32.dll', 'SetEvent'), ('kernel32.dll', 'WaitForSingleObject'), ('kernel32.dll', 'CloseHandle')]}
@@ -261,6 +346,8 @@ def process(cgen, fn, upstream):
     if not is_void_fn:
         inner += '    '+cgen.visit(pycparser.c_ast.Decl(name=ans_name, type=fn.type.type, quals=[], storage=[], funcspec=[], init=None, bitsize=None))+';\n'
     inner += '}* '+opaque+')\n{\n'
+    if recompiler.TRACE:
+        inner += '    dbg_puts("calling %s\\n");\n'%fn.name
     inner += '    '
     if not is_void_fn:
         inner += opaque+'->'+ans_name+' = '
@@ -290,3 +377,15 @@ def gen_decls(arch, fns):
             print('Warning:', i, 'is a stub')
             x86_code += 'void '+i+'(void){ *(void* volatile*)0; }\n'
     return (x86_code, arm_code, wrapper_names)
+
+def gen_dlsymtab(symbols):
+    names = sorted([j for j in symbols])
+    ans = '.align 4\n'
+    ans += '_emu_dlsymtab_start:\n'
+    for i in names:
+        ans += '.long .L_'+i+'\n'
+        ans += '.long '+i+'\n'
+    for i in names:
+        ans += '.asciz "'+i+'"\n'
+    ans += '_emu_dlsymtab_end:\n'
+    return 'asm(' + json.dumps(ans) + ');'

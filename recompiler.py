@@ -1,4 +1,4 @@
-import capstone, pefile, vmem, io, json, collections, cfstyle, traceback, x87
+import capstone, pefile, vmem, io, json, collections, cfstyle, traceback, x87, sys
 
 TRACE = False
 TRACEBACKS = True
@@ -17,10 +17,11 @@ def read_instr_at(cs, v, addr):
 cf_add_style_instrs = ('add', 'lock add', 'lock xadd', 'adc')
 cf_sub_style_instrs = ('sub', 'cmp', 'lock cmpxchg', 'neg')
 cf_xor_style_instrs = ('xor', 'and', 'test', 'or')
-cf_shift_style_instrs = ('shl', 'sal', 'shr', 'sar')
-cf_fuckup_style_instrs = ('idiv',)
+cf_shift_style_instrs = ('shl', 'sal', 'shr', 'sar', 'ror')
+cf_fuckup_style_instrs = ('idiv', 'div')
 cf_bt_style_instrs = ('bt',)
-CF_FUCKUP = {'bt', 'fstsw', 'fpu_emu'}
+cf_nyi_style_instrs = ('rol',)
+CF_FUCKUP = {'bt', 'fstsw', 'fpu_emu', 'nyi'}
 cf_ccodes = {'a', 'b', 'ae', 'be', 'g', 'l', 'ge', 'le'}
 
 def get_labels(cs, x, v, preseed0):
@@ -44,6 +45,8 @@ def get_labels(cs, x, v, preseed0):
     for i in preseed:
         cur_cf_style = 'none'
         while i not in labels:
+            if len(labels) % 1000 == 0:
+                report_progress(len(labels))
             iii = i
             labels.add(i)
             label_list.append(i)
@@ -52,11 +55,12 @@ def get_labels(cs, x, v, preseed0):
             cf_styles[i] = cur_cf_style
             instrs[i] = ii.mnemonic
             i += len(ii.bytes)
-            if (ii.mnemonic[0] == 'j' and ii.mnemonic != 'jmp') or ii.mnemonic.startswith('set') or ii.mnemonic.startswith('cmov'):
+            if ((ii.mnemonic[0] == 'j' or ii.mnemonic.startswith('bnd j')) and ii.mnemonic not in ('jmp', 'bnd jmp')) or ii.mnemonic.startswith('set') or ii.mnemonic.startswith('cmov'):
                 ef_uses.add(iii)
             if ii.mnemonic in ('adc', 'sbb'): cf_uses.add(iii)
-            if (ii.mnemonic[0] == 'j' or ii.mnemonic == 'call') and ii.op_str.startswith('0x'):
+            if (ii.mnemonic[0] == 'j' or ii.mnemonic.startswith('bnd j') or ii.mnemonic == 'call') and ii.op_str.startswith('0x'):
                 if ii.mnemonic[0] == 'j' and ii.mnemonic[1:] in cf_ccodes: cf_uses.add(iii)
+                if ii.mnemonic.startswith('bnd j') and ii.mnemonic[5:] in cf_ccodes: cf_uses.add(iii)
                 dst = int(ii.op_str, 16)
                 if dst not in preseed_set:
                     preseed.append(dst)
@@ -76,6 +80,10 @@ def get_labels(cs, x, v, preseed0):
                 cur_cf_style = 'noone'
             elif ii.mnemonic in cf_bt_style_instrs:
                 cur_cf_style = 'bt'
+            elif ii.mnemonic in cf_nyi_style_instrs:
+                cur_cf_style = 'nyi'
+            elif ii.mnemonic in ('inc', 'dec', 'lock inc', 'lock dec'):
+                cur_cf_style = 'inc'
             elif ii.mnemonic in ('fist', 'fistp') and ii.op_str.startswith('word ptr ['):
                 cur_cf_style = 'fpu_emu'
             # cutting the CFG on CF-style changes is intentional
@@ -88,7 +96,7 @@ def get_labels(cs, x, v, preseed0):
                 dst = int(ii.op_str, 16)
                 cfg[dst].append(iii)
                 cfg[i].append(iii)
-            elif ii.mnemonic == 'ret':
+            elif ii.mnemonic in ('ret', 'bnd ret'):
                 cur_cf_style = 'noone'
             else:
                 cfg[i].append(iii)
@@ -102,7 +110,7 @@ def get_labels(cs, x, v, preseed0):
                 dst = int(ii.op_str, 16)
                 d_cfg[iii].append(dst)
                 d_cfg[iii].append(i)
-            elif ii.mnemonic == 'ret':
+            elif ii.mnemonic in ('ret', 'bnd ret'):
                 cur_cf_style = 'noone'
                 b_cfg[iii].append(i)
             else:
@@ -193,6 +201,15 @@ b emu_rep_stosd
 1:
 bx lr
 
+emu_rep_movsd:
+ldr r0, [r10], #4
+str r0, [r11], #4
+sub r5, r5, #1
+cbz r5, 1f
+b emu_rep_stosd
+1:
+bx lr
+
 emu_lock_cmpxchg:
 //r0 = lea dst
 //r1 = src
@@ -212,6 +229,11 @@ emu_idiv:
 //r0 = divisor
 bl emu_unsupported
 .ascii "idiv 64\\0"
+
+emu_div:
+//r0 = divisor
+bl emu_unsupported
+.ascii "div 64\\0\\0"
 
 emu_load_xword:
 //r0 = tbyte ptr
@@ -497,6 +519,17 @@ def guess_bitness(instr):
     elif 'word' in instr.split() or set(instr.split()) & regs_16bit: return 16
     else: return 32
 
+def report_progress(compiled, total=0, fail=0, last_s=['']):
+    if compiled < 0:
+        s = ''
+    elif total > 0:
+        s = '%f%%, %d of %d instructions compiled (%d fails)'%(100 * compiled / total, compiled, total, fail)
+    else:
+        s = 'get_labels: %d instructions processed'%compiled
+    s2 = s + ' '*(len(last_s[0]) - len(s))
+    last_s[0] = s
+    print(s2, end='\r', file=sys.stderr)
+
 def read_mem(f, addr, ldrop): # TODO: rename to rw_mem
     log2 = {1: 0, 2: 1, 4: 2, 8: 3}
     try: addr = int(addr, 16)
@@ -735,6 +768,20 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
         assert target in cf_style and cf_style[target] in ('none', 'noone', cur_cf_style) and not (cf_style[target] == 'none' and cur_cf_style == 'noone'), "TODO: CF style mismatch"
         #assert fpu_state[target] == cur_fpu_state, "FPU mismatch"
         x87.check_jump(cur_fpu_state, fpu_state[target])
+    def condjump(cc, target):
+        if not isinstance(cc, tuple): cc = (cc,)
+        if abs(target - l) < 0x10000:
+            for i in cc:
+                print('b%s x86_%x'%(i, target), file=f)
+        else:
+            for i in cc[:-1]:
+                print('b%s x86_%x_jump'%(i, l), file=f)
+            i = {'eq': 'ne', 'ne': 'eq', 'cs': 'cc', 'cc': 'cs', 'hs': 'lo', 'lo': 'hs', 'mi': 'pl', 'pl': 'mi', 'vs': 'vc', 'vc': 'vs', 'hi': 'ls', 'ls': 'hi', 'ge': 'lt', 'lt': 'ge', 'gt': 'le', 'le': 'gt'}[cc[-1]]
+            print('b%s x86_%x_not_jump'%(i, l), file=f)
+            print('x86_%x_jump:'%l, file=f)
+            print('b x86_%x'%target, file=f)
+            print('x86_%x_not_jump:'%l, file=f)
+    cnt_ok = 0
     for i, l in enumerate(labels):
         print('.global x86_%x'%l, file=f)
         print('x86_%x:'%l, file=f)
@@ -756,9 +803,10 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                 except KeyError: assert False, "unknown CF style"
                 try: cur_fpu_state = fpu_state[l]
                 except KeyError: assert False, "unknown FPU state"
-                if instr in ('add', 'sub', 'xor', 'and', 'or') or instr == 'adc' and cur_cf_style == 'add' or instr == 'lock add' and ('[' not in ii.op_str or ii.op_str.find('[') > ii.op_str.find(',')):
+                if instr in ('add', 'sub', 'xor', 'and', 'or') or instr == 'adc' and cur_cf_style == 'add' or instr == 'sbb' and cur_cf_style == 'sub' or instr == 'lock add' and ('[' not in ii.op_str or ii.op_str.find('[') > ii.op_str.find(',')):
                     if instr == 'xor': instr = 'eor'
                     if instr == 'or': instr = 'orr'
+                    if instr == 'sbb': instr = 'sbc'
                     arg1, arg2 = map(str.strip, ii.op_str.split(','))
                     arg1r = read_arg(f, arg1, 'r0', bitness=bitness)
                     arg2r = read_arg(f, arg2, 'r1', bitness=bitness)
@@ -794,58 +842,63 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                         assert cur_fpu_state == fpu_state[target] == x87.DEFAULT_STATE, "FPU ABI violation: caller %r, callee %r"%(cur_fpu_state, fpu_state[target])
                         print('ldr r1, ='+hex(l+len(ii.bytes)), file=f)
                         print('str r1, [r8, #-4]!', file=f)
-                        print('b x86_%x'%target, file=f)
+                        if TRACE and abs(target - l) > 4096:
+                            print('ldr r0, =1+x86_%x'%target, file=f)
+                            print('bx r0', file=f)
+                        else:
+                            print('b x86_%x'%target, file=f)
                     ok = False
                 elif instr == 'push':
+                    assert ii.op_str.strip() != 'esp'
                     print('str %s, [r8, #-4]!'%get_as_reg(f, ii.op_str.strip(), 'r0'), file=f)
                 elif instr == 'je':
                     assert cur_cf_style not in CF_FUCKUP
                     target = int(ii.op_str, 16)
                     check_jump_to(target)
                     #assert target in cf_style and cf_style[target] in ('none', 'noone', cur_cf_style), "TODO: CF style mismatch"
-                    print('beq x86_%x'%target, file=f)
-                elif instr == 'jne':
+                    condjump('eq', target)
+                elif instr in ('jne', 'bnd jne'):
                     assert cur_cf_style not in CF_FUCKUP
                     target = int(ii.op_str, 16)
                     check_jump_to(target)
                     #assert target in cf_style and cf_style[target] in ('none', 'noone', cur_cf_style), "TODO: CF style mismatch"
-                    print('bne x86_%x'%target, file=f)
-                elif instr == 'js':
+                    condjump('ne', target)
+                elif instr in ('js', 'bnd js'):
                     assert cur_cf_style not in CF_FUCKUP
                     target = int(ii.op_str, 16)
                     check_jump_to(target)
                     #assert target in cf_style and cf_style[target] in ('none', 'noone', cur_cf_style), "TODO: CF style mismatch"
-                    print('bmi x86_%x'%target, file=f)
-                elif instr == 'jns':
+                    condjump('mi', target)
+                elif instr in ('jns', 'bnd jbs'):
                     assert cur_cf_style not in CF_FUCKUP
                     target = int(ii.op_str, 16)
                     check_jump_to(target)
                     #assert target in cf_style and cf_style[target] in ('none', 'noone', cur_cf_style), "TODO: CF style mismatch"
-                    print('bpl x86_%x'%target, file=f)
-                elif instr == 'jb':
+                    condjump('pl', target)
+                elif instr in ('jb', 'bnd jb'):
                     target = int(ii.op_str, 16)
                     cc = {'add': 'cs', 'sub': 'cc', 'bt': 'cs'}[cur_cf_style]
                     check_jump_to(target)
                     #assert target in cf_style and cf_style[target] in ('none', 'noone', cur_cf_style), "TODO: CF style mismatch"
-                    print('b'+cc+' x86_%x'%target, file=f)
-                elif instr == 'ja':
+                    condjump(cc, target)
+                elif instr in ('ja', 'bnd ja'):
                     target = int(ii.op_str, 16)
                     assert cur_cf_style == 'sub', "TODO: ja with %s-style CF"%cur_cf_style
                     check_jump_to(target)
                     #assert target in cf_style and cf_style[target] in ('none', 'noone', cur_cf_style), "TODO: CF style mismatch"
-                    print('bhi x86_%x'%target, file=f)
-                elif instr == 'jbe':
+                    condjump('hi', target)
+                elif instr in ('jbe', 'bnd jbe'):
                     target = int(ii.op_str, 16)
                     assert cur_cf_style == 'sub', "TODO: jbe with %s-style CF"%cur_cf_style
                     check_jump_to(target)
                     #assert target in cf_style and cf_style[target] in ('none', 'noone', cur_cf_style), "TODO: CF style mismatch"
-                    print('bls x86_%x'%target, file=f)
-                elif instr == 'jae':
+                    condjump('ls', target)
+                elif instr in ('jae', 'bnd jae'):
                     target = int(ii.op_str, 16)
                     cc = {'add': 'cc', 'sub': 'cs', 'bt': 'cc'}[cur_cf_style]
                     check_jump_to(target)
                     #assert target in cf_style and cf_style[target] in ('none', 'noone', cur_cf_style), "TODO: CF style mismatch"
-                    print('b'+cc+' x86_%x'%target, file=f)
+                    condjump(cc, target)
                 elif instr in ('jl', 'jle', 'jg', 'jge'):
                     assert cur_cf_style in ('add', 'sub', 'xor'), cur_cf_style
                     target = int(ii.op_str, 16)
@@ -853,18 +906,18 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                     #assert target in cf_style and cf_style[target] in ('none', 'noone', cur_cf_style), "TODO: CF style mismatch"
                     if cur_cf_style == 'xor':
                         if instr == 'jl':
-                            print('bmi x86_%x'%target, file=f)
+                            condjump('mi', target)
                         elif instr == 'jge':
-                            print('bpl x86_%x'%target, file=f)
+                            condjump('pl', target)
                         elif instr == 'jg':
-                            print('beq x86_%x'%(l+len(ii.bytes)), file=f)
-                            print('bpl x86_%x'%target, file=f)
+                            print('beq x86_%x_nojump'%l, file=f)
+                            condjump('pl', target)
+                            print('x86_%x_nojump:'%l, file=f)
                         elif instr == 'jle':
-                            print('beq x86_%x'%target, file=f)
-                            print('bmi x86_%x'%target, file=f)
+                            condjump(('eq', 'mi'), target)
                     else:
                         if len(instr) == 2: instr += 't'
-                        print('b'+instr[1:]+' x86_%x'%target, file=f)
+                        condjump(instr[1:], target)
                 elif instr == 'lea':
                     arg1, arg2 = map(str.strip, ii.op_str.split(','))
                     assert arg2.startswith('['), "invalid lea"
@@ -876,7 +929,7 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                 elif instr == 'leave':
                     print('mov r8, r9', file=f)
                     print('ldr r9, [r8], #4', file=f)
-                elif instr == 'ret':
+                elif instr in ('ret', 'bnd ret'):
                     cur_fpu_state = x87.ret_hack(f, cur_fpu_state)
                     x87.check_jump(cur_fpu_state, x87.DEFAULT_STATE)
                     print('ldr r0, [r8], #4', file=f)
@@ -888,6 +941,7 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                     ok = False
                 elif instr == 'pop':
                     arg = ii.op_str.strip()
+                    assert arg != 'esp'
                     arg_r = read_arg(f, arg, 'r0', fake=True, bitness=bitness)
                     print('ldr %s, [r8], #4'%arg_r, file=f)
                     write_arg(f, arg, arg_r)
@@ -914,10 +968,16 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                     else:
                         check_jump_to(target)
                         #assert target in cf_style and cf_style[target] in ('none', 'noone', cur_cf_style), "TODO: CF style mismatch"
-                        print('b x86_%x'%target, file=f)
+                        if TRACE and abs(target - l) > 4096:
+                            print('ldr r0, =1+x86_%x'%target, file=f)
+                            print('bx r0', file=f)
+                        else:
+                            print('b x86_%x'%target, file=f)
                     ok = False
                 elif instr == 'rep stosd':
                     print('bl emu_rep_stosd', file=f)
+                elif instr == 'rep movsd':
+                    print('bl emu_rep_movsd', file=f)
                 elif instr == 'lock cmpxchg':
                     arg1, arg2 = map(str.strip, ii.op_str.split(','))
                     if arg1 in reg_mapping:
@@ -936,7 +996,7 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                         arg1, arg2 = arg2, arg1
                     assert arg1 in reg_mapping, "invalid xchg"
                     if arg2 in reg_mapping:
-                        print('mov r0', reg_mapping[arg1], file=f)
+                        print('mov r0, %s'%reg_mapping[arg1], file=f)
                         print('mov %s, %s'%(reg_mapping[arg1], reg_mapping[arg2]), file=f)
                         print('mov '+reg_mapping[arg2]+', r0', file=f)
                     else:
@@ -957,7 +1017,7 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                     print('lsl r0, #24', file=f)
                     write_arg(f, ii.op_str, 'r0')
                 elif instr in ('movzx', 'movsx'):
-                    assert cur_cf_style not in CF_FUCKUP
+                    #assert cur_cf_style not in CF_FUCKUP
                     arg1, arg2 = map(str.strip, ii.op_str.split(','))
                     bitness1 = guess_bitness(arg1)
                     bitness2 = guess_bitness(arg2)
@@ -1064,6 +1124,41 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                             arg1r = read_arg(f, arg1, 'r0', bitness=bitness1)
                             print('lsls %s, #%d'%(arg1r, arg2 + 32 - bitness1), file=f)
                             write_arg(f, arg1, arg1r)
+                elif instr == 'ror':
+                    arg1, arg2 = map(str.strip, ii.op_str.split(','))
+                    bitness1 = guess_bitness(arg1)
+                    assert bitness1 == 32
+                    assert cur_cf_style in ('none', 'noone', 'add'), "wtf??"
+                    if arg2 == 'cl':
+                        arg1r = read_arg(f, arg1, 'r0', bitness=bitness1)
+                        print('and r2, r5, #31', file=f)
+                        print('cbnz r2, x86_%x_do'%l, file=f)
+                        print('b x86_%x'%(l+len(ii.bytes)), file=f)
+                        print('x86_%x_do:'%l, file=f)
+                        print('rors %s, r2'%arg1r, file=f)
+                        write_arg(f, arg1, arg1r)
+                    else:
+                        arg2 = int(arg2, 0)
+                        if arg2 != 0:
+                            arg1r = read_arg(f, arg1, 'r0', bitness=bitness1)
+                            print('rors %s, %s, #%d'%(arg1r, arg1r, arg2), file=f)
+                            write_arg(f, arg1, arg1r)
+                elif instr == 'rol':
+                    arg1, arg2 = map(str.strip, ii.op_str.split(','))
+                    bitness1 = guess_bitness(arg1)
+                    assert bitness1 == 32
+                    if arg2 == 'cl':
+                        arg1r = read_arg(f, arg1, 'r0', bitness=bitness1)
+                        print('and r2, r5, #31', file=f)
+                        print('rsb r2, r2, #32', file=f)
+                        print('ror %s, r2'%arg1r, file=f)
+                        write_arg(f, arg1, arg1r)
+                    else:
+                        arg2 = int(arg2, 0)
+                        if arg2 != 0:
+                            arg1r = read_arg(f, arg1, 'r0', bitness=bitness1)
+                            print('ror %s, %s, #%d'%(arg1r, arg1r, 32-arg2), file=f)
+                            write_arg(f, arg1, arg1r)
                 elif instr == 'cdq':
                     print('mov r6, r4, asr #31', file=f)
                 elif instr == 'idiv':
@@ -1078,6 +1173,17 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                     print('mul r2, r3, %s'%arg_r, file=f)
                     print('sub r6, r4, r2', file=f)
                     print('mov r4, r3', file=f)
+                elif instr == 'div':
+                    arg_r = read_arg(f, ii.op_str, 'r0', bitness=bitness)
+                    print('cbz r7, x86_%x_fast'%l, file=f)
+                    if arg_r != 'r0': print('mov r0, %s'%arg_r, file=f)
+                    print('bl emu_div', file=f)
+                    print('b x86_%x'%(l+len(ii.bytes)), file=f)
+                    print('x86_%x_fast:'%l, file=f)
+                    print('udiv r3, r4, %s'%arg_r, file=f)
+                    print('mul r2, r3, %s'%arg_r, file=f)
+                    print('sub r6, r4, r2', file=f)
+                    print('mov r4, r3', file=f)
                 elif instr == 'bt':
                     arg1, arg2 = map(str.strip, ii.op_str.split(','))
                     arg1r = read_arg(f, arg1, 'r0', bitness=bitness)
@@ -1087,7 +1193,7 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                         if shift == 0 and bitness == 32:
                             print('lsrs r0, %s, #1'%arg1r, file=f)
                         else:
-                            print('lsls r0, %s, #%d'%(bitness - shift), file=f)
+                            print('lsls r0, %s, #%d'%(arg1r, bitness - shift), file=f)
                     else:
                         print('and r2, %s, #%d'%(arg2r, bitness-1), file=f)
                         print('lsr r0, %s, r2'%arg1r, file=f)
@@ -1142,11 +1248,47 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                     arg2r = read_arg(f, arg2, 'r1', bitness=bitness)
                     print('adc %s, %s, %s'%(arg1r, arg1r, arg2r), file=f)
                     write_arg(f, arg1, arg1r)
+                elif instr == 'sbb' and cur_cf_style == 'add':
+                    #invert CF
+                    print('mov r0, #0', file=f)
+                    print('it cc', file=f)
+                    print('movcc r0, #0x80000000', file=f)
+                    print('adds r0, r0', file=f)
+                    arg1, arg2 = map(str.strip, ii.op_str.split(','))
+                    arg1r = read_arg(f, arg1, 'r0', bitness=bitness)
+                    arg2r = read_arg(f, arg2, 'r1', bitness=bitness)
+                    print('sbc %s, %s, %s'%(arg1r, arg1r, arg2r), file=f)
+                    write_arg(f, arg1, arg1r)
+                elif instr in ('adc', 'sbb'):
+                    assert False, "%s unsupported with %s-style CF"%(instr, cur_cf_style)
                 elif instr.startswith('f'):
                     x87.emit(f, cf_style, cur_cf_style, fpu_state[l], l, ii, bitness)
                 elif instr == 'cwde':
                     print('lsl r4, #16', file=f)
                     print('asr r4, #16', file=f)
+                elif instr in ('inc', 'dec') or instr in ('lock inc', 'lock dec') and '[' not in ii.op_str:
+                    instr = {'inc': 'add', 'dec': 'sub', 'lock inc': 'add', 'lock dec': 'sub'}[instr]
+                    arg_r = read_arg(f, ii.op_str.strip(), 'r0', bitness=bitness)
+                    print('%ss %s, %s, #1'%(instr, arg_r, arg_r), file=f)
+                    write_arg(f, ii.op_str.strip(), arg_r)
+                elif instr in ('lock inc', 'lock dec'):
+                    assert bitness == 32
+                    instr = {'lock inc': 'add', 'lock dec': 'sub'}[instr]
+                    lea(f, ii.op_str.split('[', 1)[1].split(']', 1)[0], 'r0')
+                    print('x86_%x_retry:'%l, file=f)
+                    print('ldrex r1, [r0]', file=f)
+                    print('%ss r1, r1, #1'%instr, file=f)
+                    print('strex r2, r1, [r0]', file=f)
+                    print('cbz r2, x86_%x_ok'%l, file=f)
+                    print('b x86_%x_retry'%l, file=f)
+                    print('x86_%x_ok:'%l, file=f)
+                elif instr == 'stosd':
+                    assert ii.op_str.strip() == 'dword ptr es:[edi], eax'
+                    print('str r4, [r11], #4', file=f)
+                elif instr == 'movsd':
+                    assert ii.op_str.strip() == 'dword ptr es:[edi], dword ptr [esi]'
+                    print('ldr r0, [r10], #4', file=f)
+                    print('str r0, [r11], #4', file=f)
                 else:
                     assert False, "unknown mnemonic %s"%ii.mnemonic
                 tr_success += 1
@@ -1157,11 +1299,16 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                 print('bl emu_unsupported', file=f) # no way to recover
                 print(asciz(instr.strip()), file=f)
                 ok = False
-        if ok and (i + 1 < len(labels) and labels[i+1] != l + len(ii.bytes)):
+        if ok and (i + 1 < len(labels) and labels[i+1] != l + len(ii.bytes) or TRACE and cnt_ok > 128):
             print('b x86_%x'%(l + len(ii.bytes)), file=f)
             ok = False
         if not ok:
             print('.ltorg', file=f)
+            cnt_ok = 0
+        else:
+            cnt_ok += 1
+        if i % 1000 == 0: report_progress(i, len(labels), tr_fail)
+    report_progress(-1)
     print('%d instructions OK, %d instructions FAIL'%(tr_success, tr_fail))
 
 def transpile(x, v, preseed, entry, wrapper_names):

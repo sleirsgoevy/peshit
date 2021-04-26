@@ -1,7 +1,7 @@
 import pefile, vmem, iatindir, stubgen, recompiler, cc, indir, tlshooks, x87
 
 arm_crt = r'''
-asm("sys_write:\nmov r7, #4\nsvc #0\nbx lr");
+asm("sys_write:\npush {r7, lr}\nmov r7, #4\nsvc #0\npop {r7, pc}");
 
 int sys_write(int, const void*, int);
 
@@ -139,14 +139,22 @@ def process_winapi(code, import_map):
         sp[i] = '(*(void**)' + hex(import_map[x]) + ')' + y
     return ''.join(sp)
 
-def main(f1, f2):
+def main(f1, f2, ex_symbols=None):
     with open(f1, 'rb') as file:
         x = pefile.PeFile(file.read())
+    ex_symbol_list = []
+    if ex_symbols != None:
+        with open(ex_symbols) as file:
+            for line in file:
+                line = tuple(line.split('#', 1)[0].split())
+                if line:
+                    ex_symbol_list.append(line)
     v = vmem.VirtualMemory(x.sections, x.mem_align)
-    imports = iatindir.iatindir(x, v, [('kernel32.dll', 'VirtualAlloc'), ('kernel32.dll', 'FlushInstructionCache')]+x87.api_deps, deps=stubgen.wrapper_deps)
+    imports = iatindir.iatindir(x, v, [('kernel32.dll', 'VirtualAlloc'), ('kernel32.dll', 'GetCurrentProcess'), ('kernel32.dll', 'FlushInstructionCache')]+x87.api_deps+ex_symbol_list, deps=stubgen.wrapper_deps)
     import_map = {l: j for i, j, k, l in imports}
     imports = [i for i in imports if i[0] != None]
     x86_stub, arm_stub, wrapper_names = stubgen.gen_decls('i686', {l: '*(void**)'+hex(j) for i, j, k, l in imports})
+    x86_stub += stubgen.gen_dlsymtab(ex_symbol_list)
     x86_code, x86_syms = cc.compile_x86(x86_stub, '')
     x86_addr, x86_buf = v.alloc(len(x86_code), 0x60000000, '.glue1')
     x86_buf[:len(x86_code)] = x86_code
