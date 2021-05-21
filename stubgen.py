@@ -193,7 +193,7 @@ __attribute__((stdcall)) FARPROC GetProcAddress(HMODULE hModule, LPCSTR lpProcNa
     opaq.end = emu_dlsymtab_end;
     opaq.hModule = hModule;
     opaq.lpProcName = lpProcName;
-    asm volatile("syscall"::"a"(&opaq));
+    asm volatile("syscall"::"a"(&opaq):"memory");
     return opaq.ans;
 }''', '''\
 struct emu_dlsymtab_entry
@@ -249,6 +249,9 @@ void wrapper_GetProcAddress(struct opaque* opaq)
     opaq->ans = left->func;
     return;
 return0:
+    dbg_puts("GetProcAddress: could not resolve ");
+    dbg_puts(opaq->lpProcName);
+    dbg_puts("\\n");
     opaq->ans = 0;
     return;
 }
@@ -335,7 +338,7 @@ def process(cgen, fn, upstream):
     for i in args:
         outer += '        '+i+',\n'
     outer += '    };\n'
-    outer += '    asm volatile("syscall"::"a"(&'+opaque+'));\n'
+    outer += '    asm volatile("syscall"::"a"(&'+opaque+'):"memory");\n'
     if not is_void_fn:
         outer += '    return '+opaque+'.'+ans_name+';\n'
     outer += '}\n'
@@ -376,16 +379,18 @@ def gen_decls(arch, fns):
         else:
             print('Warning:', i, 'is a stub')
             x86_code += 'void '+i+'(void){ *(void* volatile*)0; }\n'
+    print(wrapper_names)
     return (x86_code, arm_code, wrapper_names)
 
 def gen_dlsymtab(symbols):
-    names = sorted([j for j in symbols])
+    names = sorted([j[1] for j in symbols])
     ans = '.align 4\n'
     ans += '_emu_dlsymtab_start:\n'
     for i in names:
         ans += '.long .L_'+i+'\n'
         ans += '.long '+i+'\n'
     for i in names:
+        ans += '.L_'+i+':\n'
         ans += '.asciz "'+i+'"\n'
     ans += '_emu_dlsymtab_end:\n'
     return 'asm(' + json.dumps(ans) + ');'

@@ -29,7 +29,7 @@ def translate_cw_style(style, instr):
     elif instr in cw_zero_instrs: return 'zero'
     return 'wtf'
 
-def translate_state(state, instr):
+def translate_state(state, instr, op_str):
     depth, cw_style = state
     d = fpu_delta(instr)
     if d == ...: return DEFAULT_STATE
@@ -38,8 +38,8 @@ def translate_state(state, instr):
     cw_style = translate_cw_style(cw_style, instr)
     return (depth, cw_style)
 
-def calculate_fpu_states(d_cfg, b_cfg, instrs, preseed):
-    q1 = [(i, DEFAULT_STATE) for i in preseed]
+def calculate_states(d_cfg, b_cfg, instrs, preseed, translate_state, default_state):
+    q1 = [(i, default_state) for i in preseed]
     q2 = []
     fpu_states = {}
     while q1:
@@ -48,11 +48,14 @@ def calculate_fpu_states(d_cfg, b_cfg, instrs, preseed):
             if l in fpu_states: continue
             fpu_states[l] = state
             if l not in instrs: continue
-            state = translate_state(state, instrs[l])
+            state = translate_state(state, instrs[l][0], instrs[l][1])
             q1.extend((i, state) for i in d_cfg[l])
-            q2.extend((i, DEFAULT_STATE) for i in b_cfg[l])
+            q2.extend((i, default_state) for i in b_cfg[l])
         q1, q2 = q2, q1
     return fpu_states
+
+def calculate_fpu_states(d_cfg, b_cfg, instrs, preseed):
+    return calculate_states(d_cfg, b_cfg, instrs, preseed, translate_state, DEFAULT_STATE)
 
 def check_jump(state1, state2):
     assert state1[0] == state2[0] and state2[1] in (state1[1], 'wtf'), "FPU state mismatch: %r !~= %r"%(state1, state2)

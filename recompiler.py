@@ -1,6 +1,6 @@
 import capstone, pefile, vmem, io, json, collections, cfstyle, traceback, x87, sys
 
-TRACE = False
+TRACE = True
 TRACEBACKS = True
 
 def read_instr_at(cs, v, addr):
@@ -23,6 +23,31 @@ cf_bt_style_instrs = ('bt',)
 cf_nyi_style_instrs = ('rol',)
 CF_FUCKUP = {'bt', 'fstsw', 'fpu_emu', 'nyi'}
 cf_ccodes = {'a', 'b', 'ae', 'be', 'g', 'l', 'ge', 'le'}
+
+def translate_cf_style(cur_cf_style, instr, op_str):
+    if instr in cf_add_style_instrs:
+        cur_cf_style = 'add'
+    elif instr in cf_sub_style_instrs:
+        cur_cf_style = 'sub'
+    elif instr in cf_xor_style_instrs:
+        cur_cf_style = 'xor'
+    elif instr in ('mul', 'imul'):
+        cur_cf_style = 'imul'
+    elif instr in cf_shift_style_instrs:
+        cur_cf_style = 'shift'
+    elif instr in cf_fuckup_style_instrs:
+        cur_cf_style = 'noone'
+    elif instr in cf_bt_style_instrs:
+        cur_cf_style = 'bt'
+    elif instr in cf_nyi_style_instrs:
+        cur_cf_style = 'nyi'
+    elif instr in ('inc', 'dec', 'lock inc', 'lock dec'):
+        cur_cf_style = 'inc'
+    elif instr in ('fist', 'fistp') and op_str.startswith('word ptr ['):
+        cur_cf_style = 'fpu_emu'
+    elif instr in ('jmp', 'call', 'ret', 'bnd ret'):
+        cur_cf_style = 'noone'
+    return cur_cf_style
 
 def get_labels(cs, x, v, preseed0):
     preseed = []
@@ -53,7 +78,7 @@ def get_labels(cs, x, v, preseed0):
             ii = read_instr_at(cs, v, i)
             if ii == None: break
             cf_styles[i] = cur_cf_style
-            instrs[i] = ii.mnemonic
+            instrs[i] = (ii.mnemonic, ii.op_str)
             i += len(ii.bytes)
             if ((ii.mnemonic[0] == 'j' or ii.mnemonic.startswith('bnd j')) and ii.mnemonic not in ('jmp', 'bnd jmp')) or ii.mnemonic.startswith('set') or ii.mnemonic.startswith('cmov'):
                 ef_uses.add(iii)
@@ -111,10 +136,10 @@ def get_labels(cs, x, v, preseed0):
                 d_cfg[iii].append(dst)
                 d_cfg[iii].append(i)
             elif ii.mnemonic in ('ret', 'bnd ret'):
-                cur_cf_style = 'noone'
                 b_cfg[iii].append(i)
             else:
                 d_cfg[iii].append(i)
+    #cf_styles = x87.calculate_states(d_cfg, b_cfg, instrs, preseed1, translate_cf_style, 'noone')
     return label_list, cfstyle.calculate_cf_style(cfg, cf_uses, ef_uses, cf_styles), x87.calculate_fpu_states(d_cfg, b_cfg, instrs, preseed1)
 
 arm_crt = '''\
@@ -232,8 +257,48 @@ bl emu_unsupported
 
 emu_div:
 //r0 = divisor
-bl emu_unsupported
-.ascii "div 64\\0\\0"
+tst r0, r0
+beq emu_sigfpe
+mov r1, #65536
+vmov s18, r1
+vcvt.f64.u32 d9, s18
+vmul.f64 d9, d9, d9
+vmov s22, r6
+vcvt.f64.u32 d11, s22
+vmul.f64 d11, d11, d9
+vmov s18, r4
+vcvt.f64.u32 d9, s18
+vadd.f64 d9, d9, d11
+vmov s22, r0
+vcvt.f64.u32 d11, s22
+vdiv.f64 d9, d9, d11
+vcvt.u32.f64 s18, d9
+vmov r1, s18
+umull r2, r3, r0, r1
+subs r2, r2, r4
+sbcs r3, r3, r6
+bcs emu_div_inc
+adds r2, r2, r0
+adcs r3, r3, #0
+bcs emu_div_not_dec
+emu_div_inc:
+add r1, r1, #2
+emu_div_dec:
+sub r1, r1, #1
+emu_div_not_dec:
+umull r2, r3, r0, r1
+subs r2, r4, r2
+sbcs r3, r6, r3
+bne emu_sigfpe
+cmp r2, r0
+bcs emu_sigfpe
+mov r6, r2
+mov r4, r1
+bx lr
+
+emu_sigfpe:
+mov r0, #0
+udiv r0, r0, r0
 
 emu_load_xword:
 //r0 = tbyte ptr
@@ -765,7 +830,7 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
     tr_fail = 0
     wrapper_names = iter(wrapper_names)
     def check_jump_to(target):
-        assert target in cf_style and cf_style[target] in ('none', 'noone', cur_cf_style) and not (cf_style[target] == 'none' and cur_cf_style == 'noone'), "TODO: CF style mismatch"
+        assert target in cf_style and cf_style[target] in ('none', 'noone', cur_cf_style) and not (cf_style[target] == 'none' and (cur_cf_style == 'noone' or cur_cf_style in CF_FUCKUP)), "TODO: CF style mismatch"
         #assert fpu_state[target] == cur_fpu_state, "FPU mismatch"
         x87.check_jump(cur_fpu_state, fpu_state[target])
     def condjump(cc, target):
@@ -875,6 +940,16 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                     check_jump_to(target)
                     #assert target in cf_style and cf_style[target] in ('none', 'noone', cur_cf_style), "TODO: CF style mismatch"
                     condjump('pl', target)
+                elif instr in ('jo', 'bnd jo'):
+                    assert cur_cf_style not in CF_FUCKUP
+                    target = int(ii.op_str, 16)
+                    check_jump_to(target)
+                    condjump('vs', target)
+                elif instr in ('jno', 'bnd jno'):
+                    assert cur_cf_style not in CF_FUCKUP
+                    target = int(ii.op_str, 16)
+                    check_jump_to(target)
+                    condjump('vc', target)
                 elif instr in ('jb', 'bnd jb'):
                     target = int(ii.op_str, 16)
                     cc = {'add': 'cs', 'sub': 'cc', 'bt': 'cs'}[cur_cf_style]
@@ -1026,19 +1101,33 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                     print(('a' if instr[3] == 's' else 'l')+'sr %s, #%d'%(arg2r, bitness1 - bitness2), file=f)
                     write_arg(f, arg1, arg2r)
                 elif instr == 'fninit': pass # TODO: stub
-                elif instr in ('cmove', 'cmovs', 'cmovns'):
+                elif instr in ('cmove', 'cmovne', 'cmovs', 'cmovns'):
                     assert cur_cf_style not in CF_FUCKUP
                     arg1, arg2 = map(str.strip, ii.op_str.split(','))
-                    assert arg1 in reg_mapping and arg2 in reg_mapping, "weird cmove args"
-                    cc = {'e': 'eq', 's': 'mi', 'ns': 'pl'}[instr[4:]]
+                    assert arg1 in reg_mapping and arg2 in reg_mapping, "weird cmov args"
+                    cc = {'e': 'eq', 'ne': 'ne', 's': 'mi', 'ns': 'pl'}[instr[4:]]
                     print('it', cc, file=f)
                     print('mov%s %s, %s'%(cc, reg_mapping[arg1], reg_mapping[arg2]), file=f)
                 elif instr in ('cmovl', 'cmovle', 'cmovg', 'cmovge'):
                     assert cur_cf_style in ('add', 'sub'), cur_cf_style
                     arg1, arg2 = map(str.strip, ii.op_str.split(','))
-                    assert arg1 in reg_mapping and arg2 in reg_mapping, "weird cmove args"
+                    assert arg1 in reg_mapping and arg2 in reg_mapping, "weird cmov args"
                     cc = instr[4:]
                     if len(cc) == 1: cc += 't'
+                    print('it', cc, file=f)
+                    print('mov%s %s, %s'%(cc, reg_mapping[arg1], reg_mapping[arg2]), file=f)
+                elif instr in ('cmovb', 'cmovae'):
+                    assert cur_cf_style in ('add', 'sub'), cur_cf_style
+                    arg1, arg2 = map(str.strip, ii.op_str.split(','))
+                    assert arg1 in reg_mapping and arg2 in reg_mapping, "weird cmov args"
+                    cc = ('cs', 'cc')[(cur_cf_style == 'sub') ^ (instr == 'cmovae')]
+                    print('it', cc, file=f)
+                    print('mov%s %s, %s'%(cc, reg_mapping[arg1], reg_mapping[arg2]), file=f)
+                elif instr in ('cmova', 'cmovbe'):
+                    assert cur_cf_style == 'sub', cur_cf_style
+                    arg1, arg2 = map(str.strip, ii.op_str.split(','))
+                    assert arg1 in reg_mapping and arg2 in reg_mapping, "weird cmov args"
+                    cc = {'cmova': 'hi', 'cmovbe': 'ls'}[instr]
                     print('it', cc, file=f)
                     print('mov%s %s, %s'%(cc, reg_mapping[arg1], reg_mapping[arg2]), file=f)
                 elif instr == 'imul' and ',' not in ii.op_str:
@@ -1175,7 +1264,7 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                     print('mov r4, r3', file=f)
                 elif instr == 'div':
                     arg_r = read_arg(f, ii.op_str, 'r0', bitness=bitness)
-                    print('cbz r7, x86_%x_fast'%l, file=f)
+                    print('cbz r6, x86_%x_fast'%l, file=f)
                     if arg_r != 'r0': print('mov r0, %s'%arg_r, file=f)
                     print('bl emu_div', file=f)
                     print('b x86_%x'%(l+len(ii.bytes)), file=f)
@@ -1246,7 +1335,7 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                     arg1, arg2 = map(str.strip, ii.op_str.split(','))
                     arg1r = read_arg(f, arg1, 'r0', bitness=bitness)
                     arg2r = read_arg(f, arg2, 'r1', bitness=bitness)
-                    print('adc %s, %s, %s'%(arg1r, arg1r, arg2r), file=f)
+                    print('adcs %s, %s, %s'%(arg1r, arg1r, arg2r), file=f)
                     write_arg(f, arg1, arg1r)
                 elif instr == 'sbb' and cur_cf_style == 'add':
                     #invert CF
@@ -1257,7 +1346,7 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                     arg1, arg2 = map(str.strip, ii.op_str.split(','))
                     arg1r = read_arg(f, arg1, 'r0', bitness=bitness)
                     arg2r = read_arg(f, arg2, 'r1', bitness=bitness)
-                    print('sbc %s, %s, %s'%(arg1r, arg1r, arg2r), file=f)
+                    print('sbcs %s, %s, %s'%(arg1r, arg1r, arg2r), file=f)
                     write_arg(f, arg1, arg1r)
                 elif instr in ('adc', 'sbb'):
                     assert False, "%s unsupported with %s-style CF"%(instr, cur_cf_style)
