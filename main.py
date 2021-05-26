@@ -152,14 +152,15 @@ def main(f1, f2, ex_symbols=None):
     v = vmem.VirtualMemory(x.sections, x.mem_align)
     imports = iatindir.iatindir(x, v, [('kernel32.dll', 'VirtualAlloc'), ('kernel32.dll', 'GetCurrentProcess'), ('kernel32.dll', 'FlushInstructionCache')]+x87.api_deps+ex_symbol_list, deps=stubgen.wrapper_deps)
     import_map = {l: j for i, j, k, l in imports}
-    imports = [i for i in imports if i[0] != None]
+    ex_syms = {i[1] for i in ex_symbol_list}
+    imports = [i for i in imports if i[0] != None or i[3] in ex_syms]
     x86_stub, arm_stub, wrapper_names = stubgen.gen_decls('i686', {l: '*(void**)'+hex(j) for i, j, k, l in imports})
     x86_stub += stubgen.gen_dlsymtab(ex_symbol_list)
-    x86_code, x86_syms = cc.compile_x86(x86_stub, '')
+    x86_code, x86_syms = cc.compile_x86(x86_stub, '', v.sim_alloc())
     x86_addr, x86_buf = v.alloc(len(x86_code), 0x60000000, '.glue1')
     x86_buf[:len(x86_code)] = x86_code
     for i, j, k, l in imports:
-        if l in stubgen.external_non_funcs: continue
+        if i == None or l in stubgen.external_non_funcs: continue
         v[i:i+4] = (x86_addr + x86_syms['_'+l]).to_bytes(4, 'little')
     x86_entry = x.base_addr + int.from_bytes(x.pe_header[40:44], 'little')
     arm_tls_hook, x86_tls_callbacks = tlshooks.install_tls_hooks(x, v)

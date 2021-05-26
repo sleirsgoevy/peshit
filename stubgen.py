@@ -1,8 +1,13 @@
 import subprocess, pycparser.c_generator, recompiler, json
 
 headers = '''\
+#define _WIN32_WINNT 1000000000
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <stdio.h>
+#include <synchapi.h>
+#include <commctrl.h>
 
 //abi-only declarations
 int __getmainargs(int * _Argc, char *** _Argv, char *** _Env, int _DoWildCard, void * _StartInfo);
@@ -229,11 +234,11 @@ void wrapper_GetProcAddress(struct opaque* opaq)
             else
                 left = mid;
         }
+        if(left->name[idx] >= lpProcName[idx])
+            sep = left;
         if(sep == right || sep->name[idx] != lpProcName[idx])
             goto return0;
-        if(left->name[idx] < lpProcName[idx])
-            left = sep;
-        sep = left;
+        left = sep;
         while(right - sep > 1)
         {
             struct emu_dlsymtab_entry* mid = sep + (right - sep) / 2;
@@ -269,7 +274,7 @@ def get_headers(arch):
 def preprocess_headers(arch):
     out = get_headers(arch)
     out = out.split('__attribute__((__stdcall__))')
-    out = ''.join(i[:-1]+' volatile volatile const (' if i[-1:] == '(' else (i+' volatile volatile const' if not i[:-1].isalnum() and i[:-1] != '_' else '__attribute__((__stdcall__))') for i in out[:-1])+out[-1]
+    out = ''.join(i.rstrip()[:-1]+' volatile volatile const (' if i.rstrip()[-1:] == '(' else (i+' volatile volatile const' if not i[:-1].isalnum() and i[:-1] != '_' else '__attribute__((__stdcall__))') for i in out[:-1])+out[-1]
     stage2 = '''\
 #define __builtin_va_list va_list
 typedef int va_list;
@@ -321,6 +326,8 @@ def process(cgen, fn, upstream):
     is_void_fn = isinstance(fn.type.type.type, pycparser.c_ast.IdentifierType) and fn.type.type.type.names == ['void']
     if fn.quals[-3:] == ['volatile', 'volatile', 'const']:
         fn.quals[-3:] = ('__attribute__((stdcall))',)
+    if isinstance(fn.type.type, pycparser.c_ast.PtrDecl) and fn.type.type.quals[-3:] == ['volatile', 'volatile', 'const']:
+        fn.type.type.quals[-3:] = ('__attribute__((stdcall))',)
     ans_name = mx+'0'
     opaque = mx+'o'
     decl = cgen.visit(fn).strip()
@@ -372,14 +379,14 @@ def gen_decls(arch, fns):
         if i == '__initenv': continue
         if i in decls:
             x, y = process(cgen, decls[i], j)
-            x86_code += x
-            arm_code += y
-            if y != '':
-                wrapper_names.append(i)
         else:
             print('Warning:', i, 'is a stub')
-            x86_code += 'void '+i+'(void){ *(void* volatile*)0; }\n'
-    print(wrapper_names)
+            x = 'void '+i+'(void)\n{\n    asm volatile("syscall");\n}\n'
+            y = 'void wrapper_'+i+'(void)\n{\n    emu_unsupported_c("'+i+' is a stub!\\n");\n}\n'
+        x86_code += x
+        arm_code += y
+        if y != '':
+            wrapper_names.append(i)
     return (x86_code, arm_code, wrapper_names)
 
 def gen_dlsymtab(symbols):
@@ -388,9 +395,9 @@ def gen_dlsymtab(symbols):
     ans += '_emu_dlsymtab_start:\n'
     for i in names:
         ans += '.long .L_'+i+'\n'
-        ans += '.long '+i+'\n'
+        ans += '.long _'+i+'\n'
+    ans += '_emu_dlsymtab_end:\n'
     for i in names:
         ans += '.L_'+i+':\n'
         ans += '.asciz "'+i+'"\n'
-    ans += '_emu_dlsymtab_end:\n'
     return 'asm(' + json.dumps(ans) + ');'

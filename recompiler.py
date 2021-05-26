@@ -616,7 +616,7 @@ def read_mem(f, addr, ldrop): # TODO: rename to rw_mem
             print('add r2, %s, %s, lsl %d'%(reg_mapping[left], reg_mapping[middle], scale), file=f)
         else:
             print('add r2, %s, %s'%(reg_mapping[left], reg_mapping[middle]), file=f)
-        if right in range(-255, 256):
+        if right in range(-255, 256) and not (ldrop.startswith('v') and right % 4):
             print('%s, [r2, #%s]'%(ldrop, hex(right)), file=f)
         else:
             print('ldr r3, ='+hex(right), file=f)
@@ -629,7 +629,7 @@ def read_mem(f, addr, ldrop): # TODO: rename to rw_mem
             try: right = int(right, 0)
             except ValueError: pass
             else:
-                if right in range(-255, 256):
+                if right in range(-255, 256) and not (ldrop.startswith('v') and right % 4):
                     print(ldrop+', [%s, #%s]'%(reg_mapping[left], hex(right)), file=f)
                 else:
                     print('ldr r2, ='+hex(right), file=f)
@@ -835,7 +835,7 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
         x87.check_jump(cur_fpu_state, fpu_state[target])
     def condjump(cc, target):
         if not isinstance(cc, tuple): cc = (cc,)
-        if abs(target - l) < 0x10000:
+        if abs(target - l) < 0x10000 and not TRACE:
             for i in cc:
                 print('b%s x86_%x'%(i, target), file=f)
         else:
@@ -907,7 +907,7 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                         assert cur_fpu_state == fpu_state[target] == x87.DEFAULT_STATE, "FPU ABI violation: caller %r, callee %r"%(cur_fpu_state, fpu_state[target])
                         print('ldr r1, ='+hex(l+len(ii.bytes)), file=f)
                         print('str r1, [r8, #-4]!', file=f)
-                        if TRACE and abs(target - l) > 4096:
+                        if TRACE:
                             print('ldr r0, =1+x86_%x'%target, file=f)
                             print('bx r0', file=f)
                         else:
@@ -1043,7 +1043,7 @@ def emit(f, cs, x, v, labels, cf_style, fpu_state, wrapper_names):
                     else:
                         check_jump_to(target)
                         #assert target in cf_style and cf_style[target] in ('none', 'noone', cur_cf_style), "TODO: CF style mismatch"
-                        if TRACE and abs(target - l) > 4096:
+                        if TRACE:
                             print('ldr r0, =1+x86_%x'%target, file=f)
                             print('bx r0', file=f)
                         else:

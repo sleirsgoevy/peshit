@@ -2,7 +2,7 @@ import pefile, subprocess, tempfile, json, os
 
 CC_X86 = 'i686-w64-mingw32-'
 CC_ARM = 'llvm-mingw-20201020-ucrt-ubuntu-18.04/bin/armv7-w64-mingw32-'
-CC_ARM_HOST = 'arm-linux-gnueabihf-'
+CC_ARM_HOST = 'arm-unknown-linux-gnueabihf-'
 
 def nm(cc_prefix, file, text_vma):
     p = subprocess.Popen((cc_prefix+'nm', file), stdout=subprocess.PIPE, encoding='utf-8')
@@ -25,9 +25,9 @@ def elf_extract_text(data):
             return (addr, data[offset:offset+size])
     return None
 
-def compile_x86(c_code, asm_code):
+def compile_x86(c_code, asm_code, link_addr):
     with tempfile.TemporaryDirectory() as file:
-        p = subprocess.Popen((CC_X86+'gcc', '-x', 'c', '-', '-nostdlib', '-static', '-o', file+'/out.dll'), stdin=subprocess.PIPE, encoding='utf-8')
+        p = subprocess.Popen((CC_X86+'gcc', '-ffreestanding', '-O0', '-x', 'c', '-', '-nostdlib', '-static', '-Ttext='+hex(link_addr), '-o', file+'/out.dll'), stdin=subprocess.PIPE, encoding='utf-8')
         p.communicate('asm('+json.dumps(asm_code).replace('\\u00', '\\x')+');\n'+c_code)
         assert not p.wait()
         with open(file+'/out.dll', 'rb') as f:
