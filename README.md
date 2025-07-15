@@ -62,3 +62,7 @@ Recompiler configuration (in `recompiler.py`):
 TRACE = False # if True, EIP, translated PC, CPSR, and general-purpose registers will be printed before execution of each X86 instruction
 TRACEBACK = True # if True (default), full tracebacks of recompiler exceptions will be embedded inside the executable and printed if the execution reaches the failed instruction
 ```
+
+## License
+
+All code files in this repository are licensed under the 2-clause BSD license. The license text is [attached](LICENSE).
